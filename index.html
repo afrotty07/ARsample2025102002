@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>hato.glb viewer (floor + shadow)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #f5f5f7; }
+    #app { position: fixed; inset: 0; }
+    .ui {
+      position: fixed; right: 12px; bottom: 12px;
+      display: flex; gap: 8px; flex-wrap: wrap;
+      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      z-index: 10;
+    }
+    .ui button, .ui label {
+      background: rgba(255,255,255,0.8);
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 8px 10px;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      backdrop-filter: blur(6px);
+    }
+    .ui input[type="color"] {
+      vertical-align: middle;
+      margin-left: 6px;
+      cursor: pointer;
+    }
+    .toast {
+      position: fixed; left: 12px; bottom: 12px;
+      background: rgba(0,0,0,0.7); color: #fff;
+      padding: 8px 10px; border-radius: 6px; font-size: 12px;
+      z-index: 10; user-select: none;
+    }
+    @media (max-width: 640px) {
+      .ui { right: 8px; bottom: 8px; gap: 6px; }
+      .ui button, .ui label { padding: 7px 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div class="ui">
+    <button id="resetBtn" title="ビューをリセット">Reset View</button>
+    <button id="gridBtn" title="グリッド表示切替">Toggle Grid</button>
+    <label title="背景色を変更">BG
+      <input id="bgPicker" type="color" value="#f5f5f7">
+    </label>
+  </div>
+
+  <div class="toast">読み込み：<code>hato.glb</code></div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/loaders/GLTFLoader.js";
+
+    // ---------- 基本セットアップ ----------
+    const container = document.getElementById("app");
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf5f5f7);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 5000);
+    camera.position.set(2.5, 1.8, 3.2);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.8, 0);
+
+    // ---------- ライティング ----------
+    const hemi = new THREE.HemisphereLight(0xffffff, 0xaaaaaa, 0.75);
+    hemi.position.set(0, 1, 0);
+    scene.add(hemi);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.15);
+    dirLight.position.set(3, 6, 3);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left   = -6;
+    dirLight.shadow.camera.right  =  6;
+    dirLight.shadow.camera.top    =  6;
+    dirLight.shadow.camera.bottom = -6;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far  = 20;
+    scene.add(dirLight);
+
+    // ---------- 床（受け影） ----------
+    const floorSize = 50;
+    const floorGeo = new THREE.PlaneGeometry(floorSize, floorSize);
+    const floorMat = new THREE.ShadowMaterial({ opacity: 0.35 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0;           // y=0 を「床」に
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // グリッド（切替可能）
+    const grid = new THREE.GridHelper(floorSize, 50, 0x888888, 0xdddddd);
+    grid.position.y = 0.001; // 床の上にわずかに浮かせてZファイト回避
+    scene.add(grid);
+
+    // ---------- モデル読み込み ----------
+    const loader = new GLTFLoader();
+    const MODEL_URL = "hato.glb";  // 同階層
+    let root, originalCamPos, originalTarget = new THREE.Vector3();
+
+    const toast = document.querySelector(".toast");
+    const showToast = (msg, timeout = 1800) => {
+      if (!toast) return;
+      toast.textContent = msg;
+      toast.style.display = "block";
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => (toast.style.display = "none"), timeout);
+    };
+
+    function frameCameraToObject(obj) {
+      // バウンディングボックスでサイズと中心を取得
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      // XZ 平面中心合わせ、かつ「底」を床(y=0)に合わせる
+      const yOffset = box.min.y;        // これが「底」
+      obj.position.x -= center.x;
+      obj.position.z -= center.z;
+      obj.position.y -= yOffset;        // 底=0へ
+
+      // カメラ距離の自動調整
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = camera.fov * (Math.PI / 180);
+      const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.35; // 少し余白
+      const elev = Math.max(1.2, size.y * 0.9);
+      camera.position.set(dist * 0.9, elev + Math.min(3, maxDim), dist);
+      controls.target.set(0, Math.max(size.y * 0.5, 0.6), 0);
+      controls.update();
+
+      // 影用にライト位置も気持ち調整
+      dirLight.position.set(dist * 0.6, Math.max(6, maxDim * 1.2), dist * 0.5);
+    }
+
+    loader.load(
+      MODEL_URL,
+      (gltf) => {
+        root = gltf.scene || gltf.scenes[0];
+        root.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = false;
+            // マテリアルが透明の場合の影表現を改善
+            if (obj.material && "transparent" in obj.material && obj.material.transparent) {
+              obj.material.depthWrite = false;
+            }
+          }
+        });
+
+        scene.add(root);
+        frameCameraToObject(root);
+
+        // リセット用に初期値を保持
+        originalCamPos = camera.position.clone();
+        originalTarget.copy(controls.target);
+
+        showToast("読み込み完了：hato.glb");
+      },
+      (ev) => {
+        const total = ev.total || 1;
+        const percent = Math.min(100, Math.round((ev.loaded / total) * 100));
+        showToast(`読み込み中：${percent}%`);
+      },
+      (err) => {
+        console.error(err);
+        showToast("読み込みに失敗しました（hato.glb が見つかりません）", 4000);
+      }
+    );
+
+    // ---------- リサイズ対応 ----------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ---------- UI ----------
+    document.getElementById("resetBtn").addEventListener("click", () => {
+      if (originalCamPos) camera.position.copy(originalCamPos);
+      if (originalTarget) controls.target.copy(originalTarget);
+      controls.update();
+      showToast("ビューをリセット");
+    });
+
+    let gridVisible = true;
+    document.getElementById("gridBtn").addEventListener("click", () => {
+      gridVisible = !gridVisible;
+      grid.visible = gridVisible;
+      showToast(`Grid: ${gridVisible ? "ON" : "OFF"}`);
+    });
+
+    const bgPicker = document.getElementById("bgPicker");
+    bgPicker.addEventListener("input", (e) => {
+      const col = new THREE.Color(e.target.value);
+      scene.background = col;
+      showToast(`背景色: ${e.target.value}`);
+    });
+
+    // ---------- ループ ----------
+    const clock = new THREE.Clock();
+    (function animate() {
+      const dt = clock.getDelta();
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    })();
+
+    // ---------- タッチ操作を少し快適に ----------
+    renderer.domElement.addEventListener("touchstart", () => { /* iOSの操作初期化用ダミー */ }, { passive: true });
+  </script>
+</body>
+</html>
